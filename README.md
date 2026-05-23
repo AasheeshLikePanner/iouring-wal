@@ -1,36 +1,40 @@
-# urlog — io_uring Append-Only Log in Go
+# iouring-wal — io_uring Append-Only Log in Go
 
-A production-grade append-only write-ahead log using raw Linux `io_uring` syscalls, implemented in Go with zero external dependencies.
-
-```
-Naive fsync per write:          ~5K ops/sec
-urlog io_uring (64 writers):   ~27K ops/sec    5x faster
-urlog SQPOLL (64 writers):     ~5K ops/sec     hardware-dependent
-```
-
-## Why
-
-Most Go developers reach for `os.File.Write` + `Sync` for durable logging. This blocks the calling goroutine on disk I/O and serializes writes behind a kernel mutex. With `io_uring`, you batch submissions and harvest completions asynchronously — no per-write syscall overhead, no contention on the file's inode lock.
-
-## Architecture
+A write-ahead log using raw Linux `io_uring` syscalls, implemented in Go with zero external dependencies.
 
 ```
-Goroutines → Coalescer (batcher) → Segment Manager → io_uring Ring → Disk
+Naive fsync per write:                ~5K ops/sec
+iouring-wal interrupt (64 writers):  ~27K ops/sec    5x faster
+iouring-wal SQPOLL (64 writers):     ~5K ops/sec     hardware-dependent
 ```
 
-**`Coalescer`** — Concurrent `Append()` calls batch into groups by count/size/timeout. Each caller blocks on a `sync.Cond` until its batch completes.
+## What we built
 
-**`Encoder`** — Binary entry format: `[4B bodyLen][8B seq][4B CRC32][payload]`. Zero-alloc encode path.
+Raw syscall `io_uring` — no cgo, no liburing, no third-party Go libraries. Implemented the SQE/CQ ring protocol from scratch including mmap setup, kernel struct layouts with correct padding, and the `IORING_ENTER` syscall for submit/harvest.
 
-**`Segment`** — Fixed-size files (`segment_N.urlog`) with 40B header/trailer. Manager rotates automatically when full, seals old segments with CRC + fsync.
+SQ/CQ ring management with atomic head/tail pointers, SQE array indexing, completion harvesting with timeout, and proper mmap cleanup.
 
-**`Ring`** — Abstract io_uring interface. `LinuxRing` uses raw `syscall.Syscall6` for `io_uring_setup`/`io_uring_enter`. `FakeRing` substitutes real `pwrite`/`pwritev` for deterministic tests on any OS.
+**SQPOLL mode** — `IORING_SETUP_SQPOLL` with kernel thread wakeup. Works correctly on any kernel 5.6+, but only outperforms interrupt mode on fast NVMe hardware with spare CPU cores (see trade-offs).
+
+**`FakeRing` test double** — implements the same `Ring` interface using real `pwrite`/`pwritev`/`fsync`. All tests run deterministically on any OS without io_uring.
+
+**Condvar-based coalescer** — concurrent `Append()` calls batch into groups. Each caller blocks on `sync.Cond` until the batch completes. Replaced per-entry result channels with per-batch broadcast, eliminating 76% scheduler overhead.
+
+**SQE struct bug** — Go struct was 56 bytes, kernel expects 64. Missing `_pad1`/`_pad2`/`_pad3` padding fields. Every SQE after the first read garbage for `fd`/`offset`/`addr`. Fixed by matching the exact kernel layout.
+
+**Binary entry format** — `[4B bodyLen][8B seq][4B CRC32][payload]`. Zero-alloc encode path, CRC integrity on every entry.
+
+**Segments with rotation** — Fixed-size files with 40B header/trailer, automatic rotation on fill, sealed with CRC + fsync.
+
+**Crash recovery** — Scans the last segment entry-by-entry up to the first CRC failure. Validates bodyLen boundaries to avoid runaway scans.
+
+**Reader via mmap** — Per-segment mmap cache, `ReadAt(seq)` for point lookups, `ReadAll()` for iteration.
 
 ## Benchmarks
 
-All benchmarks on Linux ARM64 VM (Ubuntu, Kernel 6.17, 4 vCPUs, slow disk). 1KB entries, durable writes (fsync per op).
+Linux ARM64 VM (Ubuntu, Kernel 6.17, 4 vCPUs, slow disk). 1KB entries, durable writes (fsync per op).
 
-![Chart 1](chart1_methods.png)
+![Throughput by method](chart1_methods.png)
 
 ```
 Method                              Ops/sec     vs fsync
@@ -41,63 +45,52 @@ io_uring interrupt, 64 writers      26,936       5.5x
 io_uring SQPOLL, 64 writers          5,273       1.1x
 ```
 
-![Chart 2](chart2_scaling.png)
+![Concurrency scaling](chart2_scaling.png)
 
-io_uring interrupt mode scales with concurrency. SQPOLL doesn't on this hardware — the kernel thread's context switch cost (150-550µs) dwarfs the slow disk's latency.
-
-![Chart 3](chart3_sqpoll.png)
-
-**SQPOLL is a hardware optimization.** It eliminates the ~0.5µs `io_uring_enter` syscall, but on a VM with 70µs+ disk latency, that saving is noise. The kernel thread adds a context switch that costs 150-550µs per batch. SQPOLL only wins on fast NVMe (<10µs I/O) with dedicated CPU cores.
+io_uring interrupt mode scales with concurrency. SQPOLL doesn't on this hardware — the kernel thread's context switch cost (150-550µs) dwarfs disk latency.
 
 ## Tests
 
 All tests use `FakeRing` — deterministic, fast, cross-platform. No io_uring needed for development.
 
 ```
-Testing methodology: FakeRing + real filesystem + seq verification + CRC integrity
-
-Package           Tests                        Coverage
-────────────────────────────────────────────────────────
-uring             SQ/CQ lifecycle, overflow    10 tests
-encoder           100k round-trips, CRC        9 tests
-segment           Rotation, scan, recovery     16 tests
-writer            Single/multi/chaos write     9 tests
-reader            ReadAt, ReadAll, cache       10 tests
-recovery          Clean/crash/multi-segment    11 tests
-tests/concurrent  200 writers, race detection  5 tests
-tests/crash       SIGKILL simulation           5 tests
-tests/chaos       Disk full, corruption, edge   9 tests
+Package           Tests
+─────────────────────────
+uring             10 tests
+encoder           9 tests
+segment           16 tests
+writer            9 tests
+reader            10 tests
+recovery          11 tests
+tests/concurrent  5 tests
+tests/crash       5 tests
+tests/chaos       9 tests
 ```
 
-All packages pass `go test -race ./...` on both macOS and Linux.
+All packages pass `go test -race ./...` on macOS and Linux.
 
 ## Trade-offs & Limitations
 
-**io_uring interrupt mode is the right default.** On any hardware where disk latency exceeds syscall overhead (all but the fastest NVMe), it wins.
+**io_uring interrupt mode is the right default** unless you have fast NVMe and spare cores. On any hardware where disk latency exceeds syscall overhead, it wins.
 
-**SQPOLL requires fast hardware and spare CPUs.** The kernel thread competes for CPU time. On a 4-core VM, it's a net loss. On a 64-core NVMe server, it can double throughput.
+**SQPOLL requires fast hardware.** The kernel thread context switch adds 150-550µs per batch on contended systems. Only beneficial on hardware with <10µs I/O latency and dedicated CPU cores.
 
-**O_DIRECT is deferred.** Direct I/O would require 512-byte aligned buffers and registered buffers. The benefit only materializes when disk bandwidth is the bottleneck — not the case on this VM.
+**Seq gaps on crash are expected.** Sequence numbers are pre-allocated atomically before write. A crash between allocation and write creates a gap.
 
-**Seq gaps on crash are expected.** Sequence numbers are pre-allocated atomically before write. A crash between allocation and write creates a gap. Recovery scans to the last valid CRC and picks up from there.
-
-**No readers during write.** The mmap reader assumes segments are immutable after sealing. Writes go to the active segment, which the reader does not touch until rotation.
+**No readers during write.** The mmap reader only touches sealed segments, never the active write segment.
 
 ## Build & Run
 
 ```bash
 go build ./cmd/urlog
-# No CGo. No external dependencies.
 ```
 
-Benchmarks on Linux ARM64 VM (Ubuntu via lima):
-
+Benchmarks on Linux:
 ```bash
 TMPDIR=/var/tmp go test -bench=. -benchtime=5s ./bench/...
 ```
 
-Full test suite with race detector:
-
+Full test suite:
 ```bash
 go test -race -timeout 300s ./...
 ```
