@@ -34,7 +34,8 @@ SQ/CQ ring management with atomic head/tail pointers, SQE array indexing, comple
 
 Linux ARM64 VM (Ubuntu, Kernel 6.17, 4 vCPUs, slow disk). 1KB entries, durable writes (fsync per op).
 
-![Throughput by method](chart1_methods.png)
+<img width="1400" height="810" alt="image" src="https://github.com/user-attachments/assets/22bcefdf-63ef-4e09-bae1-201cc8e20af1" />
+
 
 ```
 Method                              Ops/sec     vs fsync
@@ -45,7 +46,8 @@ io_uring interrupt, 64 writers      26,936       5.5x
 io_uring SQPOLL, 64 writers          5,273       1.1x
 ```
 
-![Concurrency scaling](chart2_scaling.png)
+<img width="1400" height="802" alt="image" src="https://github.com/user-attachments/assets/70eaf491-8889-4086-a604-341cb67b8f0f" />
+
 
 io_uring interrupt mode scales with concurrency. SQPOLL doesn't on this hardware — the kernel thread's context switch cost (150-550µs) dwarfs disk latency.
 
